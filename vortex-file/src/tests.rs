@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 #![expect(clippy::cast_possible_truncation)]
+
+mod scan_metrics;
+
 use std::fs;
 use std::iter;
 use std::sync::Arc;
@@ -35,9 +38,11 @@ use vortex_array::arrays::StructArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::arrays::VarBinArray;
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::Widen;
 use vortex_array::arrays::WidenArray;
 use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::arrays::widen::WidenArraySlotsExt;
 use vortex_array::assert_arrays_eq;
 use vortex_array::builders::MapBuilder;
 use vortex_array::dtype::DType;
@@ -374,6 +379,53 @@ async fn decimal_writer_uses_default_or_session_restrictions(
         assert_eq!(uses_v2, (disable_editions || unstable) && !custom_strategy);
         assert_arrays_eq!(array, actual, &mut session.create_execution_ctx());
     }
+    Ok(())
+}
+
+/// A wide decimal with unique values is not dictionary encoded by the dict layout, but its byte
+/// parts are still compressed with every scheme. The low-cardinality most significant part is a
+/// [`Widen`] over narrow values, and those values can use an integer dictionary.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn rejected_decimal_keeps_nested_int_dict() -> VortexResult<()> {
+    let distinct = [3i128, -5, 7, 11];
+    let values = (0..16_384usize)
+        .map(|i| {
+            (distinct[(i * 7 + i / 3) % distinct.len()] << 64) + i128::try_from(i * 31).unwrap()
+        })
+        .collect::<Buffer<i128>>();
+    let decimal = DecimalArray::new(values, DecimalDType::new(38, 2), Validity::NonNullable);
+    let array = StructArray::from_fields(&[("decimal", decimal.into_array())])?.into_array();
+
+    let mut buffer = ByteBufferMut::empty();
+    let summary = SESSION
+        .write_options()
+        .disable_editions()
+        .write(&mut buffer, array.clone().to_array_stream())
+        .await?;
+    assert!(!layout_has_dict(summary.footer().layout().as_ref()));
+
+    let actual = SESSION
+        .open_options()
+        .open_buffer(buffer)?
+        .scan()?
+        .into_array_stream()?
+        .read_all()
+        .await?;
+    let has_dict_msp = actual.depth_first_traversal().any(|array| {
+        array.as_opt::<DecimalByteParts>().is_some_and(|parts| {
+            parts
+                .msp()
+                .as_opt::<Widen>()
+                .is_some_and(|msp| msp.values().is::<Dict>())
+        })
+    });
+    assert!(
+        has_dict_msp,
+        "expected a Widen msp over dict-encoded values in {}",
+        actual.display_tree()
+    );
+    assert_arrays_eq!(actual, array, &mut SESSION.create_execution_ctx());
     Ok(())
 }
 
@@ -3535,5 +3587,22 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
         .await?;
 
     assert_arrays_eq!(result, mk_struct(vec![big])?, &mut ctx);
+    Ok(())
+}
+
+/// The sparse values cut from a mostly-null column with runs of nulls must not keep a lazy filter
+/// over its compressed validity as theirs: the writer cannot serialize it.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn null_dominated_clustered_f32_writes() -> VortexResult<()> {
+    let values = PrimitiveArray::from_option_iter(
+        (0..262_144u32).map(|i| ((i / 64) % 20 == 0).then_some(i as f32)),
+    );
+    let st = StructArray::from_fields(&[("v", values.into_array())])?;
+    let stream = st.into_array().to_array_stream();
+    SESSION
+        .write_options()
+        .write(&mut ByteBufferMut::empty(), stream)
+        .await?;
     Ok(())
 }

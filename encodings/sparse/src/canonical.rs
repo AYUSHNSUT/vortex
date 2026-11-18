@@ -414,7 +414,6 @@ fn execute_sparse_lists(
                 fill_value,
                 values_dtype,
                 len,
-                total_canonical_values,
                 nullability,
                 ctx,
             )
@@ -430,19 +429,13 @@ fn execute_sparse_lists_inner<I: IntegerPType, O: OffsetBuilderPType>(
     fill_value: &Scalar,
     values_dtype: Arc<DType>,
     len: usize,
-    total_canonical_values: usize,
     nullability: Nullability,
     ctx: &mut ExecutionCtx,
 ) -> ArrayRef {
     // Create the builder with appropriate types. It is easy to just use the same type for both
     // `offsets` and `sizes` since we have no other constraints.
-    let mut builder = ListViewBuilder::<O, O>::with_capacity_in(
-        values_dtype,
-        nullability,
-        total_canonical_values,
-        len,
-        ctx.allocator(),
-    );
+    let mut builder =
+        ListViewBuilder::<O, O>::with_capacity_in(values_dtype, nullability, len, ctx.allocator());
     // The fill's elements become an array once, up front. Every gap then appends that same array,
     // so the fill's elements are stored once for the whole result however many gaps reference them.
     let fill_elements = list_scalar_elements_array(fill_value.as_list(), ctx.allocator());
@@ -910,6 +903,7 @@ mod test {
     use vortex_array::scalar::Scalar;
     use vortex_array::validity::Validity;
     use vortex_arrow::ArrowSessionExt;
+    use vortex_arrow::ExecuteArrowExt;
     use vortex_buffer::ByteBuffer;
     use vortex_buffer::buffer;
     use vortex_buffer::buffer_mut;
@@ -1136,33 +1130,23 @@ mod test {
         let sparse_struct =
             Sparse::try_new(indices, patch_values, len, fill_scalar, &mut ctx).unwrap();
 
-        let expected = SESSION
-            .arrow()
-            .execute_arrow(
-                DecimalArray::new(
-                    buffer![100i128, 200, 123, 123, 123, 123, 123, 300, 4000, 123],
-                    decimal_dtype,
-                    // NB: patch indices: [0, 1, 7, 8]; patch validity: [Valid, Valid, Valid, Invalid]; ergo 0, 1, 7 are valid.
-                    Validity::from_mask(Mask::from_excluded_indices(10, vec![8]), Nullable),
-                )
-                .into_array(),
-                None,
-                &mut ctx,
-            )
-            .unwrap();
+        let expected = DecimalArray::new(
+            buffer![100i128, 200, 123, 123, 123, 123, 123, 300, 4000, 123],
+            decimal_dtype,
+            // NB: patch indices: [0, 1, 7, 8]; patch validity: [Valid, Valid, Valid, Invalid]; ergo 0, 1, 7 are valid.
+            Validity::from_mask(Mask::from_excluded_indices(10, vec![8]), Nullable),
+        )
+        .into_array()
+        .execute_arrow(None, &mut ctx)
+        .unwrap();
 
-        let actual = SESSION
-            .arrow()
-            .execute_arrow(
-                sparse_struct
-                    .as_array()
-                    .clone()
-                    .execute::<DecimalArray>(&mut ctx)
-                    .unwrap()
-                    .into_array(),
-                None,
-                &mut ctx,
-            )
+        let actual = sparse_struct
+            .as_array()
+            .clone()
+            .execute::<DecimalArray>(&mut ctx)
+            .unwrap()
+            .into_array()
+            .execute_arrow(None, &mut ctx)
             .unwrap();
 
         assert_eq!(expected.data_type(), actual.data_type());
@@ -1931,12 +1915,8 @@ mod test {
 
         // Note that the preferred arrow list representation is `List` (not `ListView`).
         let arrow_dtype = SESSION.arrow().to_arrow_field("", expected.dtype())?;
-        let actual = SESSION
-            .arrow()
-            .execute_arrow(actual, Some(&arrow_dtype), &mut ctx)?;
-        let expected = SESSION
-            .arrow()
-            .execute_arrow(expected, Some(&arrow_dtype), &mut ctx)?;
+        let actual = actual.execute_arrow(Some(&arrow_dtype), &mut ctx)?;
+        let expected = expected.execute_arrow(Some(&arrow_dtype), &mut ctx)?;
 
         assert_eq!(actual.data_type(), expected.data_type());
         Ok(())
